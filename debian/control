@@ -1,0 +1,16 @@
+Source: scion-orchestrator
+Section: net
+Priority: optional
+Maintainer: Athul Binu <athul.binu@st.ovgu.de>
+Build-Depends: debhelper-compat (= 13), golang-any
+Standards-Version: 4.7.0
+Homepage: https://github.com/scionproto-contrib/scion-orchestrator
+Rules-Requires-Root: no
+
+Package: scion-orchestrator
+Architecture: any
+Depends: ${misc:Depends}
+Description: Management service for a SCION autonomous system
+ SCION-Orchestrator provides configuration, certificate management,
+ monitoring, and runtime management for services in a SCION autonomous
+ system.

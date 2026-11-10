@@ -1,0 +1,13 @@
+[Unit]
+Description=SCION Orchestrator
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/scion/scion-orchestrator.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/scion-orchestrator --config /etc/scion/scion-orchestrator.toml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

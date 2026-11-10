@@ -1,0 +1,5 @@
+scion-orchestrator (0.1.0) unstable; urgency=medium
+
+  * Initial Debian package.
+
+ -- Athul Binu <athul.binu@st.ovgu.de>  Tue, 10 Nov 2026 21:30:00 +0000

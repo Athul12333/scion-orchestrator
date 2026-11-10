@@ -1,0 +1,8 @@
+.debhelper/
+debhelper-build-stamp
+files
+*.debhelper
+*.debhelper.log
+*.substvars
+scion-orchestrator/
+tmp/
