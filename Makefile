@@ -10,6 +10,10 @@ DIST_DIR     := dist
 PACKAGE      := $(DIST_DIR)/scion-orchestrator_$(VERSION)_$(ARCH).deb
 NFPM         ?= $(shell command -v nfpm 2>/dev/null || echo $(HOME)/go/bin/nfpm)
 
+# Development APT repository settings
+APT_REPO_DIR ?= $(HOME)/scion-apt-repo
+APT_CODENAME ?= scion
+
 # Relative paths inside SCION_DIR to build
 SCION_CMDS := \
 	scion/cmd/scion \
@@ -128,6 +132,7 @@ help:
 	@echo "  package              Build Debian package with nFPM"
 	@echo "  verify-package       Verify generated Debian package"
 	@echo "  package-check        Build and verify Debian package"
+	@echo "  publish-apt          Build, verify, and publish package to reprepro"
 	@echo "  clean                Remove local build artefacts"
 	@echo "  clean-release        Remove $(RELEASE_DIR)/"
 	@echo "  clean-scion          Remove dev/ (cloned SCION source)"
@@ -174,3 +179,12 @@ verify-package:
 .PHONY: package-check
 package-check: package verify-package
 	@echo "==> Build and package verification completed successfully"
+
+.PHONY: publish-apt
+publish-apt: package-check
+	@test -d "$(APT_REPO_DIR)/conf" || { echo "ERROR: reprepro repository not found at $(APT_REPO_DIR)"; exit 1; }
+	@command -v reprepro >/dev/null || { echo "ERROR: reprepro is not installed"; exit 1; }
+	@echo "==> Publishing $(PACKAGE) to $(APT_REPO_DIR)"
+	@cd "$(APT_REPO_DIR)" && reprepro includedeb "$(APT_CODENAME)" "$(CURDIR)/$(PACKAGE)"
+	@cd "$(APT_REPO_DIR)" && reprepro listfilter "$(APT_CODENAME)" 'Package (== scion-orchestrator)'
+	@echo "==> APT repository publish completed"
