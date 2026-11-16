@@ -1,5 +1,7 @@
 SCION_VERSION := v0.12.0
-SCION_PACKAGE_VERSION := $(patsubst v%,%,$(SCION_VERSION))
+SCION_DEB_REVISION ?= 1
+SCION_UPSTREAM_VERSION := $(patsubst v%,%,$(SCION_VERSION))
+SCION_PACKAGE_VERSION := $(SCION_UPSTREAM_VERSION)-$(SCION_DEB_REVISION)
 SCION_REPO    := https://github.com/scionproto/scion.git
 SCION_DIR     := dev/scion
 BAZEL         ?= $(shell command -v bazel 2>/dev/null || echo $(HOME)/go/bin/bazel)
@@ -204,11 +206,11 @@ publish-apt: package-check
 scion-packages: scion-source
 	@command -v "$(BAZEL)" >/dev/null 2>&1 || test -x "$(BAZEL)" || { echo "ERROR: Bazel/Bazelisk not found"; exit 1; }
 	@echo "==> Building upstream SCION $(SCION_VERSION) Debian packages"
-	@cd "$(SCION_DIR)" && "$(BAZEL)" build //dist:deb_all
+	@cd "$(SCION_DIR)" && SCION_VERSION="$(SCION_PACKAGE_VERSION)" "$(BAZEL)" build //dist:deb_all
 	@rm -rf "$(SCION_DIST_DIR)"
 	@mkdir -p "$(SCION_DIST_DIR)"
 	@set -eu; \
-	files="$$(cd "$(SCION_DIR)" && "$(BAZEL)" cquery '//dist:deb_all' --output=files 2>/dev/null | grep '_amd64\.deb$$')"; \
+	files="$$(cd "$(SCION_DIR)" && SCION_VERSION="$(SCION_PACKAGE_VERSION)" "$(BAZEL)" cquery '//dist:deb_all' --output=files 2>/dev/null | grep '_amd64\.deb$$')"; \
 	test -n "$$files" || { echo "ERROR: no SCION amd64 packages found"; exit 1; }; \
 	for f in $$files; do \
 		cp "$(SCION_DIR)/$$f" "$(SCION_DIST_DIR)/"; \
