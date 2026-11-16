@@ -1,0 +1,32 @@
+name: scion-orchestrator
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+
+section: net
+priority: optional
+
+maintainer: Athul Binu <athul.binu@st.ovgu.de>
+description: |
+  Management service for a SCION autonomous system
+  SCION-Orchestrator provides configuration, certificate management,
+  monitoring, and runtime management for services in a SCION autonomous
+  system.
+homepage: https://github.com/scionproto-contrib/scion-orchestrator
+license: Apache-2.0
+
+contents:
+  - src: ./scion-orchestrator
+    dst: /usr/bin/scion-orchestrator
+    file_info:
+      mode: 0755
+
+  - src: ./packaging/scion-orchestrator.service
+    dst: /usr/lib/systemd/system/scion-orchestrator.service
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/debian/copyright
+    dst: /usr/share/doc/scion-orchestrator/copyright
+    file_info:
+      mode: 0644

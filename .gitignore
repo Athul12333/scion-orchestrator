@@ -48,3 +48,5 @@ bin_release
 *.tar.gz
 
 release/linux_amd64
+# Package build artifacts
+dist/

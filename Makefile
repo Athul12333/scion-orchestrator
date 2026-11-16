@@ -3,6 +3,13 @@ SCION_REPO    := https://github.com/scionproto/scion.git
 SCION_DIR     := dev/scion
 RELEASE_DIR   := release
 
+# Orchestrator Debian package settings
+VERSION      ?= 0.1.0
+ARCH         ?= amd64
+DIST_DIR     := dist
+PACKAGE      := $(DIST_DIR)/scion-orchestrator_$(VERSION)_$(ARCH).deb
+NFPM         ?= $(shell command -v nfpm 2>/dev/null || echo $(HOME)/go/bin/nfpm)
+
 # Relative paths inside SCION_DIR to build
 SCION_CMDS := \
 	scion/cmd/scion \
@@ -94,6 +101,10 @@ $(SCION_DIR)/.git:
 build:
 	CGO_ENABLED=0 go build -o scion-orchestrator .
 
+.PHONY: build-package
+build-package:
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o scion-orchestrator .
+
 .PHONY: clean
 clean:
 	rm -f scion-orchestrator scion-orchestrator.exe
@@ -112,10 +123,54 @@ help:
 	@echo "  release              Build all platforms + create archives"
 	@echo "  release-<os>-<arch>  Build a single platform, e.g. release-linux-amd64"
 	@echo "  scion-source         Clone SCION $(SCION_VERSION) into $(SCION_DIR)/"
-	@echo "  build                Build scion-orchestrator for the host"
+	@echo "  build                Build scion-orchestrator for development"
+	@echo "  build-package        Build stripped orchestrator for packaging"
+	@echo "  package              Build Debian package with nFPM"
+	@echo "  verify-package       Verify generated Debian package"
+	@echo "  package-check        Build and verify Debian package"
 	@echo "  clean                Remove local build artefacts"
 	@echo "  clean-release        Remove $(RELEASE_DIR)/"
 	@echo "  clean-scion          Remove dev/ (cloned SCION source)"
 	@echo ""
 	@echo "Platforms: $(RELEASE_TARGETS)"
 	@echo "SCION version: $(SCION_VERSION)  (override with SCION_VERSION=...)"
+
+# ---------------------------------------------------------------------------
+# Debian packaging with nFPM
+# ---------------------------------------------------------------------------
+.PHONY: package
+package: build-package
+	@echo "==> Building Debian package with nFPM"
+	@mkdir -p $(DIST_DIR)
+	@VERSION=$(VERSION) ARCH=$(ARCH) $(NFPM) package \
+		--config nfpm.yaml \
+		--packager deb \
+		--target $(DIST_DIR)/
+	@echo "==> Package written to $(DIST_DIR)/"
+
+.PHONY: verify-package
+verify-package:
+	@set -eu; \
+	contents="$$(mktemp)"; \
+	extract="$$(mktemp -d)"; \
+	trap 'rm -f "$$contents"; rm -rf "$$extract"' EXIT; \
+	test -f "$(PACKAGE)" || { echo "ERROR: $(PACKAGE) does not exist; run 'make package' first"; exit 1; }; \
+	test "$$(dpkg-deb -f "$(PACKAGE)" Package)" = "scion-orchestrator"; \
+	test "$$(dpkg-deb -f "$(PACKAGE)" Version)" = "$(VERSION)"; \
+	test "$$(dpkg-deb -f "$(PACKAGE)" Architecture)" = "$(ARCH)"; \
+	dpkg-deb --contents "$(PACKAGE)" > "$$contents"; \
+	grep -Fq './usr/bin/scion-orchestrator' "$$contents"; \
+	grep -Fq './usr/lib/systemd/system/scion-orchestrator.service' "$$contents"; \
+	grep -Fq './usr/share/doc/scion-orchestrator/copyright' "$$contents"; \
+	dpkg-deb -x "$(PACKAGE)" "$$extract"; \
+	test -x "$$extract/usr/bin/scion-orchestrator"; \
+	test "$$(stat -c '%a' "$$extract/usr/bin/scion-orchestrator")" = "755"; \
+	test "$$(stat -c '%a' "$$extract/usr/lib/systemd/system/scion-orchestrator.service")" = "644"; \
+	cmp -s packaging/scion-orchestrator.service "$$extract/usr/lib/systemd/system/scion-orchestrator.service"; \
+	file "$$extract/usr/bin/scion-orchestrator" | grep -Fq 'statically linked'; \
+	file "$$extract/usr/bin/scion-orchestrator" | grep -Fq 'stripped'; \
+	echo "==> Package verification passed: $(PACKAGE)"
+
+.PHONY: package-check
+package-check: package verify-package
+	@echo "==> Build and package verification completed successfully"
