@@ -12,6 +12,7 @@ DIST_DIR     := dist
 SCION_DIST_DIR := $(DIST_DIR)/scion
 PACKAGE      := $(DIST_DIR)/scion-orchestrator_$(VERSION)_$(ARCH).deb
 NFPM         ?= $(shell command -v nfpm 2>/dev/null || echo $(HOME)/go/bin/nfpm)
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct)
 
 # Development APT repository settings
 APT_REPO_DIR ?= $(HOME)/scion-apt-repo
@@ -154,7 +155,7 @@ help:
 package: build-package
 	@echo "==> Building Debian package with nFPM"
 	@mkdir -p $(DIST_DIR)
-	@VERSION=$(VERSION) ARCH=$(ARCH) $(NFPM) package \
+	@VERSION=$(VERSION) ARCH=$(ARCH) SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) $(NFPM) package \
 		--config nfpm.yaml \
 		--packager deb \
 		--target $(DIST_DIR)/
@@ -244,13 +245,12 @@ packages-all: package-check scion-package-check
 publish-all: packages-all
 	@test -d "$(APT_REPO_DIR)/conf" || { echo "ERROR: reprepro repository not found at $(APT_REPO_DIR)"; exit 1; }
 	@command -v reprepro >/dev/null || { echo "ERROR: reprepro is not installed"; exit 1; }
-	@echo "==> Publishing all verified packages to $(APT_REPO_DIR)"
-	@cd "$(APT_REPO_DIR)" && reprepro includedeb "$(APT_CODENAME)" "$(CURDIR)/$(PACKAGE)"
+	@echo "==> Safely publishing all verified packages to $(APT_REPO_DIR)"
+	@./scripts/publish-deb.sh "$(APT_REPO_DIR)" "$(APT_CODENAME)" "$(CURDIR)/$(PACKAGE)"
 	@set -eu; \
 	for f in "$(SCION_DIST_DIR)"/*.deb; do \
-		echo "  publishing: $$(basename "$$f")"; \
-		cd "$(APT_REPO_DIR)" && reprepro includedeb "$(APT_CODENAME)" "$(CURDIR)/$$f"; \
+		./scripts/publish-deb.sh "$(APT_REPO_DIR)" "$(APT_CODENAME)" "$(CURDIR)/$$f"; \
 	done
 	@echo "==> Repository contents:"
 	@cd "$(APT_REPO_DIR)" && reprepro list "$(APT_CODENAME)"
-	@echo "==> All packages published successfully"
+	@echo "==> Safe publication completed successfully"
