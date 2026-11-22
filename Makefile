@@ -137,6 +137,7 @@ help:
 	@echo "  release              Build all platforms + create archives"
 	@echo "  release-<os>-<arch>  Build a single platform, e.g. release-linux-amd64"
 	@echo "  scion-source         Clone SCION $(SCION_VERSION) into $(SCION_DIR)/"
+	@echo "  verify-scion-source  Verify pinned SCION source version"
 	@echo "  build                Build scion-orchestrator for development"
 	@echo "  build-package        Build stripped orchestrator for packaging"
 	@echo "  package              Build Debian package with nFPM"
@@ -267,7 +268,7 @@ publish-all: packages-all
 # Tooling / environment checks
 # ---------------------------------------------------------------------------
 .PHONY: check-tools
-check-tools:
+check-tools: verify-scion-source
 	@set -eu; \
 	echo "==> Checking build and packaging tools"; \
 	command -v go >/dev/null || { echo "ERROR: go not found"; exit 1; }; \
@@ -301,3 +302,14 @@ bootstrap-tools:
 	@echo "==> Installed Bazelisk $(BAZELISK_VERSION)"
 	@echo "==> bazel -> bazelisk launcher configured"
 	@$(MAKE) check-tools
+
+.PHONY: verify-scion-source
+verify-scion-source: scion-source
+	@set -eu; \
+	expected="$(SCION_VERSION)"; \
+	actual="$$(git -C "$(SCION_DIR)" describe --tags --exact-match 2>/dev/null || true)"; \
+	test "$$actual" = "$$expected" || { \
+		echo "ERROR: expected SCION $$expected, found $${actual:-unknown}"; \
+		exit 1; \
+	}; \
+	echo "==> SCION source verified: $$actual"
