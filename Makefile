@@ -7,6 +7,10 @@ SCION_DIR     := dev/scion
 BAZEL         ?= $(shell command -v bazel 2>/dev/null || echo $(HOME)/go/bin/bazel)
 RELEASE_DIR   := release
 
+# Pinned packaging/build tool versions
+NFPM_VERSION      ?= v2.49.0
+BAZELISK_VERSION  ?= v1.30.0
+
 # Orchestrator Debian package settings
 VERSION      ?= 0.1.0
 ARCH         ?= amd64
@@ -143,6 +147,8 @@ help:
 	@echo "  verify-scion-packages Verify SCION Debian packages"
 	@echo "  scion-package-check  Build and verify SCION Debian packages"
 	@echo "  packages-all         Build and verify all Debian packages"
+	@echo "  bootstrap-tools      Install pinned nFPM and Bazelisk versions"
+	@echo "  check-tools          Verify build and packaging tool versions"
 	@echo "  clean                Remove local build artefacts"
 	@echo "  clean-release        Remove $(RELEASE_DIR)/"
 	@echo "  clean-scion          Remove dev/ (cloned SCION source)"
@@ -256,3 +262,42 @@ publish-all: packages-all
 	@echo "==> Repository contents:"
 	@cd "$(APT_REPO_DIR)" && reprepro list "$(APT_CODENAME)"
 	@echo "==> Safe publication completed successfully"
+
+# ---------------------------------------------------------------------------
+# Tooling / environment checks
+# ---------------------------------------------------------------------------
+.PHONY: check-tools
+check-tools:
+	@set -eu; \
+	echo "==> Checking build and packaging tools"; \
+	command -v go >/dev/null || { echo "ERROR: go not found"; exit 1; }; \
+	test -x "$(NFPM)" || { echo "ERROR: nFPM not found at $(NFPM)"; exit 1; }; \
+	test -x "$(BAZEL)" || { echo "ERROR: Bazel/Bazelisk not found at $(BAZEL)"; exit 1; }; \
+	command -v dpkg-deb >/dev/null || { echo "ERROR: dpkg-deb not found"; exit 1; }; \
+	nfpm_mod="$$(go version -m "$(NFPM)" | awk '$$1 == "mod" {print $$3}')"; \
+	test "$$nfpm_mod" = "$(NFPM_VERSION)" || { echo "ERROR: expected nFPM $(NFPM_VERSION), found $$nfpm_mod"; exit 1; }; \
+	bazelisk_path="$(BAZEL)"; \
+	if test -L "$$bazelisk_path"; then bazelisk_path="$$(readlink -f "$$bazelisk_path")"; fi; \
+	bazelisk_mod="$$(go version -m "$$bazelisk_path" | awk '$$1 == "mod" {print $$3}')"; \
+	test "$$bazelisk_mod" = "$(BAZELISK_VERSION)" || { echo "ERROR: expected Bazelisk $(BAZELISK_VERSION), found $$bazelisk_mod"; exit 1; }; \
+	test -f "$(SCION_DIR)/.bazelversion" || { echo "ERROR: SCION .bazelversion missing"; exit 1; }; \
+	required_bazel="$$(cat "$(SCION_DIR)/.bazelversion")"; \
+	actual_bazel="$$(cd "$(SCION_DIR)" && "$(BAZEL)" version 2>/dev/null | awk '/Build label:/ {print $$3; exit}')"; \
+	test "$$actual_bazel" = "$$required_bazel" || { echo "ERROR: expected Bazel $$required_bazel, found $$actual_bazel"; exit 1; }; \
+	echo "  Go:       $$(go version)"; \
+	echo "  nFPM:     $$nfpm_mod"; \
+	echo "  Bazelisk: $$bazelisk_mod"; \
+	echo "  Bazel:    $$actual_bazel"; \
+	echo "==> Tool check passed"
+
+.PHONY: bootstrap-tools
+bootstrap-tools:
+	@echo "==> Installing pinned build and packaging tools"
+	@command -v go >/dev/null || { echo "ERROR: Go is required to bootstrap tools"; exit 1; }
+	@go install github.com/goreleaser/nfpm/v2/cmd/nfpm@$(NFPM_VERSION)
+	@go install github.com/bazelbuild/bazelisk@$(BAZELISK_VERSION)
+	@ln -sf "$(shell go env GOPATH)/bin/bazelisk" "$(shell go env GOPATH)/bin/bazel"
+	@echo "==> Installed nFPM $(NFPM_VERSION)"
+	@echo "==> Installed Bazelisk $(BAZELISK_VERSION)"
+	@echo "==> bazel -> bazelisk launcher configured"
+	@$(MAKE) check-tools
