@@ -1,0 +1,67 @@
+name: Debian package build
+
+on:
+  push:
+    branches:
+      - feature/debian-packaging
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  packages:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dpkg-dev \
+            file
+
+      - name: Bootstrap pinned packaging tools
+        run: make bootstrap-tools
+
+      - name: Check Docker environment
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Start SCION Bazel cache
+        run: |
+          cd dev/scion
+          ./scion.sh bazel-remote
+          docker ps --filter name=bazel-remote-cache
+
+      - name: Verify build environment
+        run: make check-tools
+
+      - name: Build and verify Debian packages
+        run: make packages-all
+
+      - name: Show generated packages
+        run: |
+          find dist -type f -name '*.deb' -print
+          for f in dist/*.deb dist/scion/*.deb; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            dpkg-deb -f "$f" Package Version Architecture
+          done
+
+      - name: Upload Debian packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            dist/*.deb
+            dist/scion/*.deb
+          if-no-files-found: error
