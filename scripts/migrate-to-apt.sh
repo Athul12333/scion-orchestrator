@@ -5,11 +5,12 @@ set -euo pipefail
 REPO_URL="${SCION_APT_REPO:-http://10.0.0.39:8081}"
 
 usage() {
-    echo "Usage: $0 [--dry-run|--apply|--cutover] [--legacy-root PATH] [--confirm-cutover]"
+    echo "Usage: $0 [--dry-run|--apply|--cutover] [--legacy-root PATH] [--stage-dir PATH] [--confirm-cutover]"
 }
 
 MODE="--dry-run"
 LEGACY_ROOT=""
+CUTOVER_STAGE_DIR=""
 CONFIRM_CUTOVER=0
 
 while [ "$#" -gt 0 ]; do
@@ -29,6 +30,14 @@ while [ "$#" -gt 0 ]; do
         --confirm-cutover)
             CONFIRM_CUTOVER=1
             shift
+            ;;
+        --stage-dir)
+            if [ "$#" -lt 2 ]; then
+                echo "[ERROR] --stage-dir requires a path" >&2
+                exit 2
+            fi
+            CUTOVER_STAGE_DIR="${2%/}"
+            shift 2
             ;;
         --legacy-root)
             if [ "$#" -lt 2 ]; then
@@ -764,18 +773,23 @@ EOF
             echo "[OK] $package $version"
         done
 
-        stage_name="$(
-            find /root -maxdepth 1 -mindepth 1 -type d                 -name 'scion-migration-stage-*' -printf '%f\n' |
-            sort |
-            tail -1
-        )"
-
-        if [ -z "$stage_name" ]; then
-            echo "[ERROR] No migration staging directory found." >&2
+        if [ -z "$CUTOVER_STAGE_DIR" ]; then
+            echo "[ERROR] --cutover requires --stage-dir PATH." >&2
             exit 1
         fi
 
-        stage_dir="/root/$stage_name"
+        stage_dir="$CUTOVER_STAGE_DIR"
+
+        case "$stage_dir" in
+            /root/scion-migration-stage-*)
+                ;;
+            *)
+                echo "[ERROR] Invalid cutover staging path: $stage_dir" >&2
+                echo "[ERROR] Expected /root/scion-migration-stage-*" >&2
+                exit 1
+                ;;
+        esac
+
         stage_config="$stage_dir/etc/scion"
         stage_state="$stage_dir/var/lib/scion"
 
