@@ -237,9 +237,103 @@ case "$MODE" in
             echo "[OK] Package-ready staging tree validated."
             echo "[INFO] Staging tree: $stage_dir"
             echo
-            echo "[STOP] Complete staging test finished."
-            echo "[INFO] Live processes, packages and configuration were not changed."
-            echo "[INFO] No processes, packages, or configuration were changed."
+            echo "[OK] Staging phase completed."
+
+            echo
+            echo "[INFO] PACKAGE INSTALL PREPARATION"
+
+            policy_file="/usr/sbin/policy-rc.d"
+            apt_source="/etc/apt/sources.list.d/scion.list"
+
+            if [ -e "$policy_file" ]; then
+                echo "[ERROR] Existing $policy_file detected." >&2
+                echo "[ERROR] Refusing to overwrite an existing service-start policy." >&2
+                exit 1
+            fi
+
+            if ! curl -fsS "$REPO_URL/dists/scion/Release" >/dev/null; then
+                echo "[ERROR] Repository unreachable: $REPO_URL" >&2
+                exit 1
+            fi
+
+            echo "[OK] Repository reachable: $REPO_URL"
+            echo "[OK] No existing policy-rc.d detected."
+
+            echo
+            echo "[INFO] INSTALLING PACKAGES WITH SERVICE STARTS BLOCKED"
+
+            cat > "$policy_file" <<'EOF'
+#!/bin/sh
+exit 101
+EOF
+            chmod 0755 "$policy_file"
+
+            cleanup_policy() {
+                rm -f "$policy_file"
+            }
+
+            trap cleanup_policy EXIT
+
+            printf 'deb [trusted=yes] %s scion main
+' "$REPO_URL"                 > "$apt_source"
+
+            echo "[INFO] Updating APT metadata"
+
+            if ! apt-get update; then
+                echo "[ERROR] apt-get update failed." >&2
+                exit 1
+            fi
+
+            packages=(
+                scion-orchestrator
+                scion-control
+                scion-daemon
+                scion-dispatcher
+                scion-router
+                scion-tools
+                scion-ip-gateway
+            )
+
+            echo "[INFO] Installing SCION packages"
+
+            if ! DEBIAN_FRONTEND=noninteractive apt-get                 -o Dpkg::Options::="--force-confdef"                 -o Dpkg::Options::="--force-confold"                 install -y "${packages[@]}"; then
+
+                echo "[ERROR] Package installation failed." >&2
+                exit 1
+            fi
+
+            cleanup_policy
+            trap - EXIT
+
+            if [ -e "$policy_file" ]; then
+                echo "[ERROR] Temporary policy-rc.d was not removed." >&2
+                exit 1
+            fi
+
+            if ! getent passwd scion >/dev/null ||
+               ! getent group scion >/dev/null; then
+                echo "[ERROR] Package installation did not create scion account." >&2
+                exit 1
+            fi
+
+            echo "[OK] scion service account exists."
+
+            for package in "${packages[@]}"; do
+                status="$(dpkg-query -W -f='${db:Status-Status}'                     "$package" 2>/dev/null || true)"
+
+                if [ "$status" != "installed" ]; then
+                    echo "[ERROR] Package not installed: $package" >&2
+                    exit 1
+                fi
+
+                version="$(dpkg-query -W -f='${Version}' "$package")"
+                echo "[OK] $package $version"
+            done
+
+            echo
+            echo "[STOP] Package-install stage completed."
+            echo "[INFO] Legacy manual SCION processes have NOT been stopped."
+            echo "[INFO] Staged configuration has NOT been installed into /etc/scion."
             exit 0
         fi
 
