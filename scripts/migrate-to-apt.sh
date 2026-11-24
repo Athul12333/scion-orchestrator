@@ -88,8 +88,157 @@ case "$MODE" in
 
             echo "[OK] Legacy configuration backup verified."
             echo "[INFO] Backup: $backup_dir/legacy-config.tar"
+
+            stage_dir="/root/scion-migration-stage-$timestamp"
+            stage_config="$stage_dir/etc/scion"
+            stage_state="$stage_dir/var/lib/scion"
+
             echo
-            echo "[STOP] Backup-only development stage completed."
+            echo "[INFO] MANUAL-LAYOUT STAGING STAGE"
+            echo "[INFO] Creating staging tree: $stage_dir"
+
+            mkdir -p                 "$stage_config/certs"                 "$stage_config/crypto"                 "$stage_config/keys"                 "$stage_config/secrets"                 "$stage_state"
+
+            echo "[OK] Empty package-ready staging tree created."
+
+            echo "[INFO] Copying runtime configuration"
+
+            install -m 0644 "$LEGACY_ROOT/config/tmp/dispatcher-tmp.toml"                 "$stage_config/dispatcher.toml"
+
+            install -m 0644 "$LEGACY_ROOT/config/tmp/br1-tmp.toml"                 "$stage_config/br-1.toml"
+
+            install -m 0644 "$LEGACY_ROOT/config/tmp/cs1-tmp.toml"                 "$stage_config/cs-1.toml"
+
+            install -m 0644 "$LEGACY_ROOT/config/tmp/sciond-tmp.toml"                 "$stage_config/sciond.toml"
+
+            cp -a "$stage_config/sciond.toml"                 "$stage_config/daemon.toml"
+
+            install -m 0644 "$LEGACY_ROOT/config/topology.json"                 "$stage_config/topology.json"
+
+            install -m 0644 "$LEGACY_ROOT/config/scion-orchestrator.toml"                 "$stage_config/scion-orchestrator.toml"
+
+            echo "[OK] Runtime configuration copied to staging."
+
+            echo "[INFO] Copying certificates, crypto material and keys"
+
+            tar --exclude='*.bak'                 -C "$LEGACY_ROOT/config"                 -cf - certs crypto keys                 | tar -C "$stage_config" -xf -
+
+            echo "[INFO] Copying service secrets"
+
+            install -m 0640                 "$LEGACY_ROOT/config/client1.secret"                 "$stage_config/secrets/client1.secret"
+
+            if [ -f "$LEGACY_ROOT/config/admin.secret" ]; then
+                install -m 0640                     "$LEGACY_ROOT/config/admin.secret"                     "$stage_config/secrets/admin.secret"
+            fi
+
+            echo "[OK] Crypto material, certificates, keys and secrets copied."
+
+            echo "[INFO] Copying persistent databases"
+
+            if [ -d "$LEGACY_ROOT/config/database" ]; then
+                find "$LEGACY_ROOT/config/database"                     -maxdepth 1                     -type f                     -exec cp -a {} "$stage_state/" \;
+            fi
+
+            echo "[INFO] Rewriting staged paths"
+
+            find "$stage_config"                 -maxdepth 1                 -type f                 -name '*.toml'                 -exec sed -i                     -e "s#$LEGACY_ROOT/config/database/#/var/lib/scion/#g"                     -e "s#$LEGACY_ROOT/config/#/etc/scion/#g"                     {} +
+
+            sed -i                 's#^shared_secret = "/etc/scion/client1.secret"#shared_secret = "/etc/scion/secrets/client1.secret"#'                 "$stage_config/cs-1.toml"
+
+            sed -i                 -E 's#^[[:space:]]*bin[[:space:]]*=.*#bin = "/usr/bin"#'                 "$stage_config/scion-orchestrator.toml"
+
+            echo "[OK] Database files copied and staged paths rewritten."
+
+            echo "[INFO] Applying staging permissions"
+
+            chown -R root:root "$stage_config" "$stage_state"
+
+            chmod 0755 "$stage_config"
+            chmod 0750 "$stage_state"
+            chmod 0750 "$stage_config/secrets"
+
+            find "$stage_config/secrets" -type f                 -exec chmod 0640 {} +
+
+            find "$stage_config/crypto/as" -type f -name '*.key'                 -exec chmod 0640 {} +
+
+            find "$stage_config/certs" -type f                 -exec chmod 0644 {} +
+
+            find "$stage_config/crypto" -type f                 \( -name '*.crt' -o -name '*.pem' -o -name '*.tmpl' \)                 -exec chmod 0644 {} +
+
+            find "$stage_config/keys" -type f -name '*.key'                 -exec chmod 0640 {} +
+
+            find "$stage_config" -maxdepth 1 -type f                 -exec chmod 0644 {} +
+
+            if getent passwd scion >/dev/null &&
+               getent group scion >/dev/null; then
+                chown -R scion:scion "$stage_state"
+                chown root:scion "$stage_config/secrets"
+
+                find "$stage_config/secrets" -type f                     -exec chown root:scion {} +
+
+                find "$stage_config/crypto/as" -type f -name '*.key'                     -exec chown root:scion {} +
+
+                find "$stage_config/keys" -type f -name '*.key'                     -exec chown root:scion {} +
+
+                echo "[OK] Applied scion service ownership."
+            else
+                echo "[INFO] scion account is not installed yet."
+                echo "[INFO] Staged files remain root-owned until package installation."
+            fi
+
+            echo "[INFO] Validating staging tree"
+
+            required_files=(
+                "$stage_config/topology.json"
+                "$stage_config/dispatcher.toml"
+                "$stage_config/daemon.toml"
+                "$stage_config/cs-1.toml"
+                "$stage_config/br-1.toml"
+                "$stage_config/scion-orchestrator.toml"
+                "$stage_config/secrets/client1.secret"
+                "$stage_config/crypto/as/cp-as.key"
+            )
+
+            for required in "${required_files[@]}"; do
+                if [ ! -f "$required" ]; then
+                    echo "[ERROR] Missing staged file: $required" >&2
+                    exit 1
+                fi
+            done
+
+            if grep -Rqs "$LEGACY_ROOT" "$stage_config"; then
+                echo "[ERROR] Legacy path remains in staged configuration:" >&2
+                grep -Rsn "$LEGACY_ROOT" "$stage_config" >&2 || true
+                exit 1
+            fi
+
+            as_chain="$(find "$stage_config/crypto/as"                 -maxdepth 1 -type f -name 'ISD*-AS*.pem' | head -1)"
+
+            if [ -z "$as_chain" ]; then
+                echo "[ERROR] No AS certificate chain found in staging" >&2
+                exit 1
+            fi
+
+            cert_hash="$(openssl x509                 -in "$as_chain"                 -pubkey -noout |
+                openssl pkey -pubin -outform DER 2>/dev/null |
+                sha256sum |
+                awk '{print $1}')"
+
+            key_hash="$(openssl pkey                 -in "$stage_config/crypto/as/cp-as.key"                 -pubout -outform DER 2>/dev/null |
+                sha256sum |
+                awk '{print $1}')"
+
+            if [ "$cert_hash" != "$key_hash" ]; then
+                echo "[ERROR] AS certificate/private-key mismatch" >&2
+                exit 1
+            fi
+
+            echo "[OK] AS certificate and private key match."
+            echo "[OK] Package-ready staging tree validated."
+            echo "[INFO] Staging tree: $stage_dir"
+            echo
+            echo "[STOP] Complete staging test finished."
+            echo "[INFO] Live processes, packages and configuration were not changed."
             echo "[INFO] No processes, packages, or configuration were changed."
             exit 0
         fi
