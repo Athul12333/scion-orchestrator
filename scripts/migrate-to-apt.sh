@@ -1405,9 +1405,34 @@ EOF
                 return 1
             fi
 
-            rm -rf /etc/scion /var/lib/scion
-            mv "$config_tmp" /etc/scion
-            mv "$state_tmp" /var/lib/scion
+            if [ -z "$cutover_backup" ] || [ ! -d "$cutover_backup" ]; then
+                echo "[ERROR] Cutover backup is unavailable before target switch." >&2
+                return 1
+            fi
+
+            if [ -e "$cutover_backup/pre-cutover-etc-scion" ] ||
+               [ -e "$cutover_backup/pre-cutover-var-lib-scion" ]; then
+                echo "[ERROR] Preserved target directory already exists in backup." >&2
+                return 1
+            fi
+
+            if [ -d /etc/scion ]; then
+                mv /etc/scion "$cutover_backup/pre-cutover-etc-scion"
+            fi
+
+            if [ -d /var/lib/scion ]; then
+                mv /var/lib/scion "$cutover_backup/pre-cutover-var-lib-scion"
+            fi
+
+            if ! mv "$config_tmp" /etc/scion; then
+                echo "[ERROR] Failed to activate staged /etc/scion." >&2
+                return 1
+            fi
+
+            if ! mv "$state_tmp" /var/lib/scion; then
+                echo "[ERROR] Failed to activate staged /var/lib/scion." >&2
+                return 1
+            fi
 
             echo "[OK] Staged configuration installed into /etc/scion."
             echo "[OK] Final database state installed into /var/lib/scion."
@@ -1492,11 +1517,89 @@ EOF
             echo "[INFO] Staged manifest: $snapshot_manifest"
         }
 
+        recover_legacy_runtime() {
+            local recovery_failure=0
+
+            echo
+            echo "[WARNING] Cutover failed. Starting recovery."
+
+            if ! stop_packaged_services; then
+                echo "[ERROR] Failed to fully stop packaged services during recovery." >&2
+                recovery_failure=1
+            fi
+
+            if ! restore_cutover_targets; then
+                echo "[ERROR] Failed to restore package-managed targets." >&2
+                echo "[ERROR] Legacy runtime will NOT be restarted automatically." >&2
+                recovery_failure=1
+            else
+                if ! restart_legacy_runtime; then
+                    echo "[ERROR] Failed to restore the complete legacy runtime." >&2
+                    recovery_failure=1
+                fi
+            fi
+
+            if [ "$recovery_failure" -ne 0 ]; then
+                echo "[ERROR] Automatic recovery was incomplete." >&2
+
+                if [ -n "$cutover_backup" ]; then
+                    echo "[INFO] Recovery backup: $cutover_backup" >&2
+                fi
+
+                return 1
+            fi
+
+            echo "[OK] Legacy runtime recovery completed."
+            echo "[INFO] Recovery backup: $cutover_backup"
+        }
+
         echo
         echo "[OK] Complete manual-layout cutover preflight passed."
         echo "[INFO] Staging tree: $stage_dir"
         echo "[INFO] Verified legacy PIDs: ${legacy_pids[*]}"
-        echo "[STOP] No processes, configuration, or databases were changed."
+
+        echo
+        echo "[INFO] BEGINNING CONFIRMED MANUAL-LAYOUT CUTOVER"
+
+        if ! backup_cutover_targets; then
+            echo "[ERROR] Cutover target backup failed." >&2
+            echo "[ERROR] Legacy runtime has NOT been stopped." >&2
+            exit 1
+        fi
+
+        if ! stop_legacy_processes; then
+            echo "[ERROR] Legacy shutdown failed." >&2
+            recover_legacy_runtime || true
+            exit 1
+        fi
+
+        if ! snapshot_final_databases; then
+            echo "[ERROR] Final database snapshot failed." >&2
+            recover_legacy_runtime || true
+            exit 1
+        fi
+
+        if ! install_staged_targets; then
+            echo "[ERROR] Target installation failed." >&2
+            recover_legacy_runtime || true
+            exit 1
+        fi
+
+        if ! start_packaged_services; then
+            echo "[ERROR] Packaged service startup failed." >&2
+            recover_legacy_runtime || true
+            exit 1
+        fi
+
+        echo
+        echo "========================================"
+        echo " Manual-layout SCION cutover completed"
+        echo "========================================"
+        echo
+        echo "[OK] Legacy manual runtime has been replaced."
+        echo "[OK] Package-managed SCION services are active."
+        echo "[INFO] Cutover backup: $cutover_backup"
+        echo "[INFO] Staging tree: $stage_dir"
         exit 0
         ;;
     -h|--help)
