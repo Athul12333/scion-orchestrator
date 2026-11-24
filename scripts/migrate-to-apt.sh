@@ -46,9 +46,52 @@ case "$MODE" in
         ;;
     --apply)
         if [ -n "$LEGACY_ROOT" ]; then
-            echo "[ERROR] --apply with --legacy-root is not implemented yet." >&2
-            echo "[INFO] Use --dry-run while manual-layout migration is under development." >&2
-            exit 2
+            if [ "$(id -u)" -ne 0 ]; then
+                echo "[ERROR] --apply must be run as root." >&2
+                exit 1
+            fi
+
+            if [ ! -d "$LEGACY_ROOT/config" ]; then
+                echo "[ERROR] Legacy configuration not found: $LEGACY_ROOT/config" >&2
+                exit 1
+            fi
+
+            timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            backup_dir="/root/scion-migration-backup-$timestamp"
+
+            echo "[INFO] MANUAL-LAYOUT BACKUP STAGE"
+            echo "[INFO] Legacy root: $LEGACY_ROOT"
+            echo "[INFO] Creating backup: $backup_dir"
+
+            available_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+
+            if [ "$available_kb" -lt 102400 ]; then
+                echo "[ERROR] Less than 100 MB free disk space." >&2
+                exit 1
+            fi
+
+            mkdir -p "$backup_dir"
+
+            tar                 --exclude='config/logs'                 -C "$LEGACY_ROOT"                 -cf "$backup_dir/legacy-config.tar"                 config
+
+            tar -tf "$backup_dir/legacy-config.tar" >/dev/null
+
+            if ! tar -tf "$backup_dir/legacy-config.tar" | grep -q '^config/topology.json$'; then
+                echo "[ERROR] Backup verification failed: topology.json missing" >&2
+                exit 1
+            fi
+
+            if ! tar -tf "$backup_dir/legacy-config.tar" | grep -q '^config/crypto/as/ISD1-AS152.pem$'; then
+                echo "[ERROR] Backup verification failed: AS certificate missing" >&2
+                exit 1
+            fi
+
+            echo "[OK] Legacy configuration backup verified."
+            echo "[INFO] Backup: $backup_dir/legacy-config.tar"
+            echo
+            echo "[STOP] Backup-only development stage completed."
+            echo "[INFO] No processes, packages, or configuration were changed."
+            exit 0
         fi
 
         if [ "$(id -u)" -ne 0 ]; then
