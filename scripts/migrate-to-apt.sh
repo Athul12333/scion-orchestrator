@@ -2,13 +2,44 @@
 
 set -euo pipefail
 
-REPO_URL="${SCION_APT_REPO:-http://10.0.0.39:8080}"
+REPO_URL="${SCION_APT_REPO:-http://10.0.0.39:8081}"
 
 usage() {
-    echo "Usage: $0 [--dry-run|--apply]"
+    echo "Usage: $0 [--dry-run|--apply] [--legacy-root PATH]"
 }
 
-MODE="${1:---dry-run}"
+MODE="--dry-run"
+LEGACY_ROOT=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run)
+            MODE="--dry-run"
+            shift
+            ;;
+        --apply)
+            MODE="--apply"
+            shift
+            ;;
+        --legacy-root)
+            if [ "$#" -lt 2 ]; then
+                echo "[ERROR] --legacy-root requires a path" >&2
+                exit 2
+            fi
+            LEGACY_ROOT="${2%/}"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "[ERROR] Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
 case "$MODE" in
     --dry-run)
@@ -413,10 +444,45 @@ echo "[INFO] No files or services will be modified."
 echo
 echo "[1/5] Checking existing SCION configuration"
 
-if [ -d /etc/scion ]; then
-    echo "[OK] /etc/scion exists"
+CONFIG_DIR="/etc/scion"
+
+if [ -n "$LEGACY_ROOT" ]; then
+    CONFIG_DIR="$LEGACY_ROOT/config"
+
+    echo "[INFO] Legacy root: $LEGACY_ROOT"
+    echo "[INFO] Legacy configuration: $CONFIG_DIR"
+
+    if [ ! -d "$LEGACY_ROOT" ]; then
+        echo "[ERROR] Legacy root does not exist: $LEGACY_ROOT" >&2
+        exit 1
+    fi
+
+    if [ ! -d "$CONFIG_DIR" ]; then
+        echo "[ERROR] Legacy configuration does not exist: $CONFIG_DIR" >&2
+        exit 1
+    fi
+
+    if [ -f "$CONFIG_DIR/topology.json" ]; then
+        isd_as="$(grep -m1 '"isd_as"' "$CONFIG_DIR/topology.json" | sed -E 's/.*"isd_as"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+        echo "[OK] Detected ISD-AS: $isd_as"
+    else
+        echo "[WARNING] Missing topology: $CONFIG_DIR/topology.json"
+    fi
+
+    echo "[INFO] Checking manually started SCION processes"
+
+    for process in dispatcher router control daemon; do
+        if pgrep -x "$process" >/dev/null; then
+            echo "[FOUND] Running manual process: $process"
+        else
+            echo "[NOT FOUND] Manual process: $process"
+        fi
+    done
+
+elif [ -d "$CONFIG_DIR" ]; then
+    echo "[OK] $CONFIG_DIR exists"
 else
-    echo "[WARNING] /etc/scion does not exist"
+    echo "[WARNING] $CONFIG_DIR does not exist"
 fi
 
 echo
@@ -444,14 +510,14 @@ echo "    -> packaged scion-dispatcher.service"
 echo "scion-daemon.service"
 echo "    -> packaged scion-daemon.service"
 
-for config in /etc/scion/cs-*.toml; do
+for config in "$CONFIG_DIR"/cs-*.toml; do
     [ -e "$config" ] || continue
     instance="$(basename "$config" .toml)"
     echo "$config"
     echo "    -> scion-control@${instance}.service"
 done
 
-for config in /etc/scion/br-*.toml; do
+for config in "$CONFIG_DIR"/br-*.toml; do
     [ -e "$config" ] || continue
     instance="$(basename "$config" .toml)"
     echo "$config"
