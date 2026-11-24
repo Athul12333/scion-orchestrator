@@ -45,6 +45,12 @@ case "$MODE" in
     --dry-run)
         ;;
     --apply)
+        if [ -n "$LEGACY_ROOT" ]; then
+            echo "[ERROR] --apply with --legacy-root is not implemented yet." >&2
+            echo "[INFO] Use --dry-run while manual-layout migration is under development." >&2
+            exit 2
+        fi
+
         if [ "$(id -u)" -ne 0 ]; then
             echo "[ERROR] --apply must be run as root." >&2
             exit 1
