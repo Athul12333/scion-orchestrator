@@ -5,11 +5,12 @@ set -euo pipefail
 REPO_URL="${SCION_APT_REPO:-http://10.0.0.39:8081}"
 
 usage() {
-    echo "Usage: $0 [--dry-run|--apply|--cutover] [--legacy-root PATH]"
+    echo "Usage: $0 [--dry-run|--apply|--cutover] [--legacy-root PATH] [--confirm-cutover]"
 }
 
 MODE="--dry-run"
 LEGACY_ROOT=""
+CONFIRM_CUTOVER=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -23,6 +24,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --cutover)
             MODE="--cutover"
+            shift
+            ;;
+        --confirm-cutover)
+            CONFIRM_CUTOVER=1
             shift
             ;;
         --legacy-root)
@@ -712,6 +717,12 @@ EOF
             exit 1
         fi
 
+        if [ "$CONFIRM_CUTOVER" -ne 1 ]; then
+            echo "[STOP] Cutover confirmation is missing." >&2
+            echo "[INFO] Re-run with --confirm-cutover only after final review." >&2
+            exit 1
+        fi
+
         if [ ! -d "$LEGACY_ROOT/config" ]; then
             echo "[ERROR] Legacy configuration not found: $LEGACY_ROOT/config" >&2
             exit 1
@@ -878,6 +889,8 @@ EOF
             "daemon|$legacy_config/tmp/sciond-tmp.toml"
         )
 
+        legacy_names=()
+        legacy_configs=()
         legacy_pids=()
 
         for spec in "${process_specs[@]}"; do
@@ -904,9 +917,556 @@ EOF
                 exit 1
             fi
 
+            legacy_names+=("$process_name")
+            legacy_configs+=("$process_config")
             legacy_pids+=("${matches[0]}")
             echo "[OK] $process_name PID ${matches[0]} -> $process_config"
         done
+
+        stop_legacy_processes() {
+            local index
+            local process_name
+            local process_config
+            local pid
+            local current_args
+            local attempt
+
+            echo "[INFO] Stopping verified legacy SCION processes"
+
+            # Reverse order: daemon, control, router, dispatcher.
+            for ((index=${#legacy_pids[@]} - 1; index >= 0; index--)); do
+                process_name="${legacy_names[$index]}"
+                process_config="${legacy_configs[$index]}"
+                pid="${legacy_pids[$index]}"
+
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    echo "[ERROR] $process_name PID $pid disappeared before shutdown." >&2
+                    return 1
+                fi
+
+                current_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+
+                case "$current_args" in
+                    *"--config $process_config"*)
+                        ;;
+                    *)
+                        echo "[ERROR] PID identity changed before shutdown: $pid" >&2
+                        echo "[ERROR] Expected config: $process_config" >&2
+                        return 1
+                        ;;
+                esac
+
+                echo "[INFO] Sending SIGTERM to $process_name PID $pid"
+                kill -TERM "$pid"
+
+                for attempt in $(seq 1 30); do
+                    if ! kill -0 "$pid" 2>/dev/null; then
+                        echo "[OK] $process_name PID $pid stopped."
+                        break
+                    fi
+
+                    sleep 1
+                done
+
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "[ERROR] $process_name PID $pid did not stop after 30 seconds." >&2
+                    echo "[ERROR] Refusing to send SIGKILL automatically." >&2
+                    return 1
+                fi
+            done
+
+            for pid in "${legacy_pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "[ERROR] Legacy PID remains alive after shutdown: $pid" >&2
+                    return 1
+                fi
+            done
+
+            echo "[INFO] Verifying no legacy SCION runtime remains"
+
+            for spec in "${process_specs[@]}"; do
+                process_name="${spec%%|*}"
+                process_config="${spec#*|}"
+                remaining=0
+
+                while read -r pid; do
+                    [ -n "$pid" ] || continue
+
+                    current_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+
+                    case "$current_args" in
+                        *"--config $process_config"*)
+                            echo "[ERROR] Legacy runtime remains: $process_name PID $pid" >&2
+                            remaining=1
+                            ;;
+                    esac
+                done < <(pgrep -x "$process_name" || true)
+
+                if [ "$remaining" -ne 0 ]; then
+                    return 1
+                fi
+            done
+
+            echo "[OK] All verified legacy SCION processes stopped."
+            echo "[OK] No matching legacy SCION runtime remains."
+        }
+
+        restart_legacy_runtime() {
+            local restart_specs
+            local spec
+            local process_name
+            local process_config
+            local output_file
+            local pid
+            local matches
+
+            restart_specs=(
+                "dispatcher|$legacy_config/tmp/dispatcher-tmp.toml|/tmp/as152-dispatcher-start.log"
+                "daemon|$legacy_config/tmp/sciond-tmp.toml|/tmp/as152-daemon-start.log"
+                "control|$legacy_config/tmp/cs1-tmp.toml|/tmp/as152-control-start.log"
+                "router|$legacy_config/tmp/br1-tmp.toml|/tmp/as152-router-start.log"
+            )
+
+            echo "[INFO] Restarting legacy SCION runtime"
+
+            for spec in "${restart_specs[@]}"; do
+                process_name="${spec%%|*}"
+                spec="${spec#*|}"
+                process_config="${spec%%|*}"
+                output_file="${spec#*|}"
+
+                if [ ! -x "$LEGACY_ROOT/bin/$process_name" ]; then
+                    echo "[ERROR] Legacy binary missing: $LEGACY_ROOT/bin/$process_name" >&2
+                    return 1
+                fi
+
+                if [ ! -f "$process_config" ]; then
+                    echo "[ERROR] Legacy config missing: $process_config" >&2
+                    return 1
+                fi
+
+                (
+                    cd "$LEGACY_ROOT"
+                    nohup "./bin/$process_name"                         --config "$process_config"                         >>"$output_file" 2>&1 </dev/null &
+                )
+
+                echo "[INFO] Started legacy $process_name"
+            done
+
+            sleep 3
+
+            for spec in "${restart_specs[@]}"; do
+                process_name="${spec%%|*}"
+                spec="${spec#*|}"
+                process_config="${spec%%|*}"
+                matches=0
+
+                while read -r pid; do
+                    [ -n "$pid" ] || continue
+
+                    current_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+
+                    case "$current_args" in
+                        *"--config $process_config"*)
+                            matches=$((matches + 1))
+                            echo "[OK] Legacy $process_name PID $pid"
+                            ;;
+                    esac
+                done < <(pgrep -x "$process_name" || true)
+
+                if [ "$matches" -ne 1 ]; then
+                    echo "[ERROR] Legacy restart verification failed: $process_name" >&2
+                    echo "[ERROR] Expected one matching process, found $matches" >&2
+                    echo "[INFO] Startup output: ${spec#*|}" >&2
+                    return 1
+                fi
+            done
+
+            echo "[OK] Legacy SCION runtime restarted and verified."
+        }
+
+        stop_packaged_services() {
+            local units
+            local unit
+            local failure=0
+
+            units=(
+                scion-orchestrator.service
+                scion-daemon.service
+                scion-control@cs-1.service
+                scion-router@br-1.service
+                scion-dispatcher.service
+            )
+
+            echo "[INFO] Stopping package-managed SCION services"
+
+            for unit in "${units[@]}"; do
+                if systemctl is-active --quiet "$unit"; then
+                    echo "[INFO] Stopping $unit"
+
+                    if ! systemctl stop "$unit"; then
+                        echo "[ERROR] Failed to stop $unit" >&2
+                        systemctl status "$unit" --no-pager -l >&2 || true
+                        failure=1
+                    fi
+                fi
+
+                if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                    echo "[INFO] Disabling $unit"
+
+                    if ! systemctl disable "$unit"; then
+                        echo "[ERROR] Failed to disable $unit" >&2
+                        failure=1
+                    fi
+                fi
+            done
+
+            systemctl reset-failed "${units[@]}" || true
+
+            for unit in "${units[@]}"; do
+                if systemctl is-active --quiet "$unit"; then
+                    echo "[ERROR] Packaged service remains active: $unit" >&2
+                    failure=1
+                fi
+            done
+
+            if [ "$failure" -ne 0 ]; then
+                return 1
+            fi
+
+            echo "[OK] Package-managed SCION services are stopped and disabled."
+        }
+
+        start_packaged_services() {
+            local units
+            local unit
+            local attempt
+
+            units=(
+                scion-dispatcher.service
+                scion-router@br-1.service
+                scion-control@cs-1.service
+                scion-daemon.service
+                scion-orchestrator.service
+            )
+
+            echo "[INFO] Starting package-managed SCION services"
+
+            systemctl daemon-reload
+            systemctl reset-failed "${units[@]}" || true
+
+            for unit in "${units[@]}"; do
+                echo "[INFO] Enabling and starting $unit"
+
+                if ! systemctl enable --now "$unit"; then
+                    echo "[ERROR] Failed to start $unit" >&2
+                    systemctl status "$unit" --no-pager -l >&2 || true
+                    journalctl -u "$unit" -n 80 --no-pager >&2 || true
+                    return 1
+                fi
+
+                for attempt in $(seq 1 15); do
+                    if systemctl is-active --quiet "$unit"; then
+                        break
+                    fi
+
+                    sleep 1
+                done
+
+                if ! systemctl is-active --quiet "$unit"; then
+                    echo "[ERROR] Service is not active: $unit" >&2
+                    systemctl status "$unit" --no-pager -l >&2 || true
+                    journalctl -u "$unit" -n 80 --no-pager >&2 || true
+                    return 1
+                fi
+
+                sleep 2
+
+                if ! systemctl is-active --quiet "$unit"; then
+                    echo "[ERROR] Service exited after initial startup: $unit" >&2
+                    systemctl status "$unit" --no-pager -l >&2 || true
+                    journalctl -u "$unit" -n 80 --no-pager >&2 || true
+                    return 1
+                fi
+
+                echo "[OK] $unit is active."
+            done
+
+            for unit in "${units[@]}"; do
+                if ! systemctl is-enabled --quiet "$unit"; then
+                    echo "[ERROR] Service is not enabled: $unit" >&2
+                    return 1
+                fi
+            done
+
+            echo "[OK] All package-managed SCION services are active and enabled."
+        }
+
+        cutover_backup=""
+
+        backup_cutover_targets() {
+            cutover_backup="/root/scion-cutover-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+
+            echo "[INFO] Backing up current package-managed targets"
+            mkdir -p "$cutover_backup"
+
+            if [ -d /etc/scion ]; then
+                tar -C /etc -cf "$cutover_backup/etc-scion.tar" scion
+                tar -tf "$cutover_backup/etc-scion.tar" >/dev/null
+                touch "$cutover_backup/had-etc-scion"
+                echo "[OK] Backed up /etc/scion"
+            fi
+
+            if [ -d /var/lib/scion ]; then
+                tar -C /var/lib -cf "$cutover_backup/var-lib-scion.tar" scion
+                tar -tf "$cutover_backup/var-lib-scion.tar" >/dev/null
+                touch "$cutover_backup/had-var-lib-scion"
+                echo "[OK] Backed up /var/lib/scion"
+            fi
+
+            printf '%s\n' "$stage_dir" > "$cutover_backup/staging-tree"
+            printf '%s\n' "$LEGACY_ROOT" > "$cutover_backup/legacy-root"
+
+            echo "[OK] Cutover target backup verified."
+            echo "[INFO] Cutover backup: $cutover_backup"
+        }
+
+        restore_cutover_targets() {
+            echo "[INFO] Restoring package-managed targets from cutover backup"
+
+            if [ -z "$cutover_backup" ] || [ ! -d "$cutover_backup" ]; then
+                echo "[ERROR] Cutover backup directory is unavailable." >&2
+                return 1
+            fi
+
+            if [ -e "$cutover_backup/had-etc-scion" ]; then
+                if [ ! -f "$cutover_backup/etc-scion.tar" ]; then
+                    echo "[ERROR] Missing /etc/scion backup archive." >&2
+                    return 1
+                fi
+
+                tar -tf "$cutover_backup/etc-scion.tar" >/dev/null
+            fi
+
+            if [ -e "$cutover_backup/had-var-lib-scion" ]; then
+                if [ ! -f "$cutover_backup/var-lib-scion.tar" ]; then
+                    echo "[ERROR] Missing /var/lib/scion backup archive." >&2
+                    return 1
+                fi
+
+                tar -tf "$cutover_backup/var-lib-scion.tar" >/dev/null
+            fi
+
+            rm -rf                 /etc/scion                 /var/lib/scion                 /etc/scion.cutover-new                 /var/lib/scion.cutover-new
+
+            if [ -e "$cutover_backup/had-etc-scion" ]; then
+                tar -C /etc -xf "$cutover_backup/etc-scion.tar"
+                echo "[OK] Restored /etc/scion"
+            fi
+
+            if [ -e "$cutover_backup/had-var-lib-scion" ]; then
+                tar -C /var/lib -xf "$cutover_backup/var-lib-scion.tar"
+                echo "[OK] Restored /var/lib/scion"
+            fi
+
+            systemctl daemon-reload
+
+            echo "[OK] Package-managed targets restored from backup."
+            echo "[INFO] Restored backup: $cutover_backup"
+        }
+
+        install_staged_targets() {
+            local config_tmp="/etc/scion.cutover-new"
+            local state_tmp="/var/lib/scion.cutover-new"
+
+            echo "[INFO] Preparing package-managed SCION targets"
+
+            if lsof +D /etc/scion 2>/dev/null | grep -q .; then
+                echo "[ERROR] A process still has files open under /etc/scion." >&2
+                lsof +D /etc/scion >&2 || true
+                return 1
+            fi
+
+            if lsof +D /var/lib/scion 2>/dev/null | grep -q .; then
+                echo "[ERROR] A process still has files open under /var/lib/scion." >&2
+                lsof +D /var/lib/scion >&2 || true
+                return 1
+            fi
+
+            rm -rf "$config_tmp" "$state_tmp"
+            mkdir -p "$config_tmp" "$state_tmp"
+
+            cp -a "$stage_config"/. "$config_tmp"/
+            cp -a "$stage_state"/. "$state_tmp"/
+
+            chown -R root:root "$config_tmp"
+            chmod 0755 "$config_tmp"
+
+            find "$config_tmp" -type d -exec chmod 0755 {} +
+            find "$config_tmp" -type f -exec chmod 0644 {} +
+
+            if [ -d "$config_tmp/secrets" ]; then
+                chown root:scion "$config_tmp/secrets"
+                chmod 0750 "$config_tmp/secrets"
+
+                find "$config_tmp/secrets"                     -maxdepth 1                     -type f                     -exec chown root:scion {} +                     -exec chmod 0640 {} +
+            fi
+
+            if [ -f "$config_tmp/secrets/admin.secret" ]; then
+                chown root:root "$config_tmp/secrets/admin.secret"
+                chmod 0600 "$config_tmp/secrets/admin.secret"
+            fi
+
+            if [ -d "$config_tmp/crypto/as" ]; then
+                chown root:scion "$config_tmp/crypto/as"
+                chmod 0750 "$config_tmp/crypto/as"
+
+                find "$config_tmp/crypto/as"                     -maxdepth 1                     -type f                     -name '*.key'                     -exec chown root:scion {} +                     -exec chmod 0640 {} +
+            fi
+
+            if [ -d "$config_tmp/keys" ]; then
+                chown root:scion "$config_tmp/keys"
+                chmod 0750 "$config_tmp/keys"
+
+                find "$config_tmp/keys"                     -maxdepth 1                     -type f                     -name '*.key'                     -exec chown root:scion {} +                     -exec chmod 0640 {} +
+            fi
+
+            if [ -d "$config_tmp/crypto/ca" ]; then
+                chown root:root "$config_tmp/crypto/ca"
+                chmod 0700 "$config_tmp/crypto/ca"
+
+                find "$config_tmp/crypto/ca"                     -maxdepth 1                     -type f                     -name '*.key'                     -exec chown root:root {} +                     -exec chmod 0600 {} +
+            fi
+
+            chown -R scion:scion "$state_tmp"
+            chmod 0750 "$state_tmp"
+            find "$state_tmp" -maxdepth 1 -type f -exec chmod 0640 {} +
+
+            required_target_files=(
+                "$config_tmp/topology.json"
+                "$config_tmp/dispatcher.toml"
+                "$config_tmp/daemon.toml"
+                "$config_tmp/cs-1.toml"
+                "$config_tmp/br-1.toml"
+                "$config_tmp/scion-orchestrator.toml"
+                "$config_tmp/secrets/client1.secret"
+                "$config_tmp/crypto/as/cp-as.key"
+            )
+
+            for required_file in "${required_target_files[@]}"; do
+                if [ ! -f "$required_file" ]; then
+                    echo "[ERROR] Prepared target is missing: $required_file" >&2
+                    return 1
+                fi
+            done
+
+            if grep -RqsF "$LEGACY_ROOT" "$config_tmp"; then
+                echo "[ERROR] Legacy-root reference exists in prepared target." >&2
+                grep -RsnF "$LEGACY_ROOT" "$config_tmp" >&2 || true
+                return 1
+            fi
+
+            if [ "$(stat -c '%U:%G %a' "$config_tmp/secrets/client1.secret")" !=                  "root:scion 640" ]; then
+                echo "[ERROR] Invalid client1.secret ownership or mode." >&2
+                return 1
+            fi
+
+            if [ "$(stat -c '%U:%G %a' "$config_tmp/crypto/as/cp-as.key")" !=                  "root:scion 640" ]; then
+                echo "[ERROR] Invalid AS-key ownership or mode." >&2
+                return 1
+            fi
+
+            if [ "$(stat -c '%U:%G %a' "$state_tmp")" !=                  "scion:scion 750" ]; then
+                echo "[ERROR] Invalid state-directory ownership or mode." >&2
+                return 1
+            fi
+
+            rm -rf /etc/scion /var/lib/scion
+            mv "$config_tmp" /etc/scion
+            mv "$state_tmp" /var/lib/scion
+
+            echo "[OK] Staged configuration installed into /etc/scion."
+            echo "[OK] Final database state installed into /var/lib/scion."
+        }
+
+        snapshot_final_databases() {
+            local snapshot_tmp
+            local source_manifest
+            local snapshot_manifest
+            local source_count
+            local snapshot_count
+
+            echo "[INFO] Creating final stopped database snapshot"
+
+            if lsof +D "$legacy_database" 2>/dev/null | grep -q .; then
+                echo "[ERROR] A process still has legacy database files open." >&2
+                lsof +D "$legacy_database" >&2 || true
+                return 1
+            fi
+
+            source_count="$(
+                find "$legacy_database"                     -maxdepth 1                     -type f |
+                wc -l
+            )"
+
+            if [ "$source_count" -eq 0 ]; then
+                echo "[ERROR] Legacy database directory is empty." >&2
+                return 1
+            fi
+
+            snapshot_tmp="${stage_state}.final-tmp"
+            source_manifest="${stage_dir}/legacy-database.sha256"
+            snapshot_manifest="${stage_dir}/staged-database.sha256"
+
+            rm -rf "$snapshot_tmp"
+            mkdir -p "$snapshot_tmp"
+
+            find "$legacy_database"                 -maxdepth 1                 -type f                 -exec cp -a {} "$snapshot_tmp/" \;
+
+            snapshot_count="$(
+                find "$snapshot_tmp"                     -maxdepth 1                     -type f |
+                wc -l
+            )"
+
+            if [ "$snapshot_count" -ne "$source_count" ]; then
+                echo "[ERROR] Database snapshot file count mismatch." >&2
+                rm -rf "$snapshot_tmp"
+                return 1
+            fi
+
+            (
+                cd "$legacy_database"
+                find . -maxdepth 1 -type f -print0 |
+                    sort -z |
+                    xargs -0 sha256sum
+            ) > "$source_manifest"
+
+            (
+                cd "$snapshot_tmp"
+                find . -maxdepth 1 -type f -print0 |
+                    sort -z |
+                    xargs -0 sha256sum
+            ) > "$snapshot_manifest"
+
+            if ! cmp -s "$source_manifest" "$snapshot_manifest"; then
+                echo "[ERROR] Final database snapshot hash verification failed." >&2
+                diff -u "$source_manifest" "$snapshot_manifest" >&2 || true
+                rm -rf "$snapshot_tmp"
+                return 1
+            fi
+
+            rm -rf "$stage_state"
+            mv "$snapshot_tmp" "$stage_state"
+
+            chown -R scion:scion "$stage_state"
+            chmod 0750 "$stage_state"
+            find "$stage_state" -maxdepth 1 -type f -exec chmod 0640 {} +
+
+            echo "[OK] Final database snapshot verified."
+            echo "[OK] Database files: $snapshot_count"
+            echo "[INFO] Source manifest: $source_manifest"
+            echo "[INFO] Staged manifest: $snapshot_manifest"
+        }
 
         echo
         echo "[OK] Complete manual-layout cutover preflight passed."
