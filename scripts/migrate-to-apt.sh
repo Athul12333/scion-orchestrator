@@ -1027,13 +1027,14 @@ EOF
                 "router|$legacy_config/tmp/br1-tmp.toml|/tmp/as152-router-start.log"
             )
 
-            echo "[INFO] Restarting legacy SCION runtime"
+            echo "[INFO] Restoring legacy SCION runtime"
 
             for spec in "${restart_specs[@]}"; do
                 process_name="${spec%%|*}"
                 spec="${spec#*|}"
                 process_config="${spec%%|*}"
                 output_file="${spec#*|}"
+                matches=0
 
                 if [ ! -x "$LEGACY_ROOT/bin/$process_name" ]; then
                     echo "[ERROR] Legacy binary missing: $LEGACY_ROOT/bin/$process_name" >&2
@@ -1043,6 +1044,29 @@ EOF
                 if [ ! -f "$process_config" ]; then
                     echo "[ERROR] Legacy config missing: $process_config" >&2
                     return 1
+                fi
+
+                while read -r pid; do
+                    [ -n "$pid" ] || continue
+
+                    current_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+
+                    case "$current_args" in
+                        *"--config $process_config"*)
+                            matches=$((matches + 1))
+                            ;;
+                    esac
+                done < <(pgrep -x "$process_name" || true)
+
+                if [ "$matches" -gt 1 ]; then
+                    echo "[ERROR] Multiple legacy $process_name processes already exist." >&2
+                    echo "[ERROR] Matching processes: $matches" >&2
+                    return 1
+                fi
+
+                if [ "$matches" -eq 1 ]; then
+                    echo "[OK] Legacy $process_name is already running."
+                    continue
                 fi
 
                 (
