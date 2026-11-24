@@ -1283,14 +1283,20 @@ EOF
 
             rm -rf                 /etc/scion                 /var/lib/scion                 /etc/scion.cutover-new                 /var/lib/scion.cutover-new
 
-            if [ -e "$cutover_backup/had-etc-scion" ]; then
+            if [ -d "$cutover_backup/pre-cutover-etc-scion" ]; then
+                mv "$cutover_backup/pre-cutover-etc-scion" /etc/scion
+                echo "[OK] Restored preserved /etc/scion"
+            elif [ -e "$cutover_backup/had-etc-scion" ]; then
                 tar -C /etc -xf "$cutover_backup/etc-scion.tar"
-                echo "[OK] Restored /etc/scion"
+                echo "[OK] Restored /etc/scion from archive"
             fi
 
-            if [ -e "$cutover_backup/had-var-lib-scion" ]; then
+            if [ -d "$cutover_backup/pre-cutover-var-lib-scion" ]; then
+                mv "$cutover_backup/pre-cutover-var-lib-scion" /var/lib/scion
+                echo "[OK] Restored preserved /var/lib/scion"
+            elif [ -e "$cutover_backup/had-var-lib-scion" ]; then
                 tar -C /var/lib -xf "$cutover_backup/var-lib-scion.tar"
-                echo "[OK] Restored /var/lib/scion"
+                echo "[OK] Restored /var/lib/scion from archive"
             fi
 
             systemctl daemon-reload
