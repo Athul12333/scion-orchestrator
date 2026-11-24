@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_URL="${SCION_APT_REPO:-http://10.0.0.39:8081}"
 
 usage() {
-    echo "Usage: $0 [--dry-run|--apply] [--legacy-root PATH]"
+    echo "Usage: $0 [--dry-run|--apply|--cutover] [--legacy-root PATH]"
 }
 
 MODE="--dry-run"
@@ -19,6 +19,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --apply)
             MODE="--apply"
+            shift
+            ;;
+        --cutover)
+            MODE="--cutover"
             shift
             ;;
         --legacy-root)
@@ -695,6 +699,220 @@ EOF
         echo
         echo "[OK] Package-provided services are active."
         echo "[INFO] Backup location: $backup_dir"
+        exit 0
+        ;;
+    --cutover)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "[ERROR] --cutover must be run as root." >&2
+            exit 1
+        fi
+
+        if [ -z "$LEGACY_ROOT" ]; then
+            echo "[ERROR] --cutover requires --legacy-root PATH." >&2
+            exit 1
+        fi
+
+        if [ ! -d "$LEGACY_ROOT/config" ]; then
+            echo "[ERROR] Legacy configuration not found: $LEGACY_ROOT/config" >&2
+            exit 1
+        fi
+
+        legacy_config="$LEGACY_ROOT/config"
+        legacy_database="$legacy_config/database"
+
+        echo "[INFO] MANUAL-LAYOUT CUTOVER PREFLIGHT"
+        echo "[INFO] Legacy root: $LEGACY_ROOT"
+
+        if ! getent passwd scion >/dev/null ||
+           ! getent group scion >/dev/null; then
+            echo "[ERROR] Required scion account is missing." >&2
+            exit 1
+        fi
+
+        echo "[OK] scion service account exists."
+
+        packages=(
+            scion-orchestrator
+            scion-control
+            scion-daemon
+            scion-dispatcher
+            scion-router
+            scion-tools
+            scion-ip-gateway
+        )
+
+        for package in "${packages[@]}"; do
+            status="$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)"
+
+            if [ "$status" != "installed" ]; then
+                echo "[ERROR] Required package not installed: $package" >&2
+                exit 1
+            fi
+
+            version="$(dpkg-query -W -f='${Version}' "$package")"
+            echo "[OK] $package $version"
+        done
+
+        stage_name="$(
+            find /root -maxdepth 1 -mindepth 1 -type d                 -name 'scion-migration-stage-*' -printf '%f\n' |
+            sort |
+            tail -1
+        )"
+
+        if [ -z "$stage_name" ]; then
+            echo "[ERROR] No migration staging directory found." >&2
+            exit 1
+        fi
+
+        stage_dir="/root/$stage_name"
+        stage_config="$stage_dir/etc/scion"
+        stage_state="$stage_dir/var/lib/scion"
+
+        if [ ! -d "$stage_config" ] || [ ! -d "$stage_state" ]; then
+            echo "[ERROR] Incomplete staging tree: $stage_dir" >&2
+            exit 1
+        fi
+
+        echo "[OK] Selected staging tree: $stage_dir"
+
+        required_stage_files=(
+            "$stage_config/topology.json"
+            "$stage_config/dispatcher.toml"
+            "$stage_config/daemon.toml"
+            "$stage_config/cs-1.toml"
+            "$stage_config/br-1.toml"
+            "$stage_config/scion-orchestrator.toml"
+            "$stage_config/secrets/client1.secret"
+            "$stage_config/crypto/as/cp-as.key"
+        )
+
+        for required_file in "${required_stage_files[@]}"; do
+            if [ ! -f "$required_file" ]; then
+                echo "[ERROR] Missing staged file: $required_file" >&2
+                exit 1
+            fi
+        done
+
+        if grep -RqsF "$LEGACY_ROOT" "$stage_config"; then
+            echo "[ERROR] Legacy-root reference remains in staging." >&2
+            grep -RsnF "$LEGACY_ROOT" "$stage_config" >&2 || true
+            exit 1
+        fi
+
+        as_chain="$(
+            find "$stage_config/crypto/as"                 -maxdepth 1                 -type f                 -name 'ISD*-AS*.pem' |
+            head -1
+        )"
+
+        if [ -z "$as_chain" ] || [ ! -f "$as_chain" ]; then
+            echo "[ERROR] Staged AS certificate chain is missing." >&2
+            exit 1
+        fi
+
+        cert_hash="$(
+            openssl x509 -in "$as_chain" -pubkey -noout 2>/dev/null |
+            openssl pkey -pubin -outform DER 2>/dev/null |
+            sha256sum |
+            awk '{print $1}'
+        )"
+
+        key_hash="$(
+            openssl pkey                 -in "$stage_config/crypto/as/cp-as.key"                 -pubout -outform DER 2>/dev/null |
+            sha256sum |
+            awk '{print $1}'
+        )"
+
+        if [ "$cert_hash" != "$key_hash" ]; then
+            echo "[ERROR] Staged AS certificate/private-key mismatch." >&2
+            exit 1
+        fi
+
+        if [ ! -d "$legacy_database" ]; then
+            echo "[ERROR] Legacy database directory missing: $legacy_database" >&2
+            exit 1
+        fi
+
+        echo "[OK] Required staged files exist."
+        echo "[OK] No legacy-root references remain."
+        echo "[OK] Staged AS certificate/private key match."
+        echo "[OK] Legacy database source exists."
+
+        required_units=(
+            scion-orchestrator.service
+            scion-dispatcher.service
+            scion-daemon.service
+            scion-control@.service
+            scion-router@.service
+        )
+
+        for unit in "${required_units[@]}"; do
+            if ! systemctl cat "$unit" >/dev/null 2>&1; then
+                echo "[ERROR] Packaged systemd unit missing: $unit" >&2
+                exit 1
+            fi
+        done
+
+        echo "[OK] Required packaged systemd units exist."
+
+        target_units=(
+            scion-orchestrator.service
+            scion-dispatcher.service
+            scion-daemon.service
+            scion-control@cs-1.service
+            scion-router@br-1.service
+        )
+
+        for unit in "${target_units[@]}"; do
+            if systemctl is-active --quiet "$unit"; then
+                echo "[ERROR] Packaged service already active: $unit" >&2
+                exit 1
+            fi
+        done
+
+        echo "[OK] Packaged target services are inactive."
+
+        process_specs=(
+            "dispatcher|$legacy_config/tmp/dispatcher-tmp.toml"
+            "router|$legacy_config/tmp/br1-tmp.toml"
+            "control|$legacy_config/tmp/cs1-tmp.toml"
+            "daemon|$legacy_config/tmp/sciond-tmp.toml"
+        )
+
+        legacy_pids=()
+
+        for spec in "${process_specs[@]}"; do
+            process_name="${spec%%|*}"
+            process_config="${spec#*|}"
+            matches=()
+
+            while read -r pid; do
+                [ -n "$pid" ] || continue
+
+                args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+
+                case "$args" in
+                    *"--config $process_config"*)
+                        matches+=("$pid")
+                        ;;
+                esac
+            done < <(pgrep -x "$process_name" || true)
+
+            if [ "${#matches[@]}" -ne 1 ]; then
+                echo "[ERROR] Expected exactly one $process_name process for:" >&2
+                echo "[ERROR] $process_config" >&2
+                echo "[ERROR] Matches found: ${#matches[@]}" >&2
+                exit 1
+            fi
+
+            legacy_pids+=("${matches[0]}")
+            echo "[OK] $process_name PID ${matches[0]} -> $process_config"
+        done
+
+        echo
+        echo "[OK] Complete manual-layout cutover preflight passed."
+        echo "[INFO] Staging tree: $stage_dir"
+        echo "[INFO] Verified legacy PIDs: ${legacy_pids[*]}"
+        echo "[STOP] No processes, configuration, or databases were changed."
         exit 0
         ;;
     -h|--help)
