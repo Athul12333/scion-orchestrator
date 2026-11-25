@@ -12,7 +12,7 @@ NFPM_VERSION      ?= v2.49.0
 BAZELISK_VERSION  ?= v1.30.0
 
 # Orchestrator Debian package settings
-VERSION      ?= 0.1.0
+VERSION      ?= 0.1.2
 ARCH         ?= amd64
 DIST_DIR     := dist
 SCION_DIST_DIR := $(DIST_DIR)/scion
@@ -197,72 +197,20 @@ verify-package:
 package-check: package verify-package
 	@echo "==> Build and package verification completed successfully"
 
-.PHONY: publish-apt
-publish-apt: package-check
-	@test -d "$(APT_REPO_DIR)/conf" || { echo "ERROR: reprepro repository not found at $(APT_REPO_DIR)"; exit 1; }
-	@command -v reprepro >/dev/null || { echo "ERROR: reprepro is not installed"; exit 1; }
-	@echo "==> Publishing $(PACKAGE) to $(APT_REPO_DIR)"
-	@cd "$(APT_REPO_DIR)" && reprepro includedeb "$(APT_CODENAME)" "$(CURDIR)/$(PACKAGE)"
-	@cd "$(APT_REPO_DIR)" && reprepro listfilter "$(APT_CODENAME)" 'Package (== scion-orchestrator)'
-	@echo "==> APT repository publish completed"
-
 # ---------------------------------------------------------------------------
 # Upstream SCION Debian packages
 # ---------------------------------------------------------------------------
-.PHONY: scion-packages
-scion-packages: scion-source
-	@command -v "$(BAZEL)" >/dev/null 2>&1 || test -x "$(BAZEL)" || { echo "ERROR: Bazel/Bazelisk not found"; exit 1; }
-	@echo "==> Building upstream SCION $(SCION_VERSION) Debian packages"
-	@cd "$(SCION_DIR)" && SCION_VERSION="$(SCION_PACKAGE_VERSION)" "$(BAZEL)" build //dist:deb_all
-	@rm -rf "$(SCION_DIST_DIR)"
-	@mkdir -p "$(SCION_DIST_DIR)"
-	@set -eu; \
-	files="$$(cd "$(SCION_DIR)" && SCION_VERSION="$(SCION_PACKAGE_VERSION)" "$(BAZEL)" cquery '//dist:deb_all' --output=files 2>/dev/null | grep '_amd64\.deb$$')"; \
-	test -n "$$files" || { echo "ERROR: no SCION amd64 packages found"; exit 1; }; \
-	for f in $$files; do \
-		cp "$(SCION_DIR)/$$f" "$(SCION_DIST_DIR)/"; \
-	done
-	@echo "==> SCION packages collected in $(SCION_DIST_DIR)/"
+include packaging/scion-packages/targets.mk
 
-.PHONY: verify-scion-packages
-verify-scion-packages:
-	@set -eu; \
-	expected="scion-control scion-daemon scion-dispatcher scion-ip-gateway scion-router scion-tools"; \
-	count=0; \
-	for pkg in $$expected; do \
-		f="$$(find "$(SCION_DIST_DIR)" -maxdepth 1 -type f -name "$${pkg}_*_amd64.deb" -print -quit)"; \
-		test -n "$$f" || { echo "ERROR: missing $$pkg package"; exit 1; }; \
-		test "$$(dpkg-deb -f "$$f" Package)" = "$$pkg" || { echo "ERROR: wrong package name in $$f"; exit 1; }; \
-		test "$$(dpkg-deb -f "$$f" Version)" = "$(SCION_PACKAGE_VERSION)" || { echo "ERROR: wrong version in $$f"; exit 1; }; \
-		test "$$(dpkg-deb -f "$$f" Architecture)" = "$(ARCH)" || { echo "ERROR: wrong architecture in $$f"; exit 1; }; \
-		echo "  verified: $$pkg $(SCION_PACKAGE_VERSION) $(ARCH)"; \
-		count=$$((count + 1)); \
-	done; \
-	actual="$$(find "$(SCION_DIST_DIR)" -maxdepth 1 -type f -name 'scion-*_amd64.deb' | wc -l)"; \
-	test "$$actual" -eq "$$count" || { echo "ERROR: expected $$count SCION packages, found $$actual"; exit 1; }; \
-	echo "==> SCION package verification passed"
+# ---------------------------------------------------------------------------
+# Combined package workflow
+# ---------------------------------------------------------------------------
+include packaging/packages-all/targets.mk
 
-.PHONY: scion-package-check
-scion-package-check: scion-packages verify-scion-packages
-	@echo "==> SCION build and package verification completed successfully"
-
-.PHONY: packages-all
-packages-all: package-check scion-package-check
-	@echo "==> All orchestrator and SCION packages built and verified successfully"
-
-.PHONY: publish-all
-publish-all: packages-all
-	@test -d "$(APT_REPO_DIR)/conf" || { echo "ERROR: reprepro repository not found at $(APT_REPO_DIR)"; exit 1; }
-	@command -v reprepro >/dev/null || { echo "ERROR: reprepro is not installed"; exit 1; }
-	@echo "==> Safely publishing all verified packages to $(APT_REPO_DIR)"
-	@./scripts/publish-deb.sh "$(APT_REPO_DIR)" "$(APT_CODENAME)" "$(CURDIR)/$(PACKAGE)"
-	@set -eu; \
-	for f in "$(SCION_DIST_DIR)"/*.deb; do \
-		./scripts/publish-deb.sh "$(APT_REPO_DIR)" "$(APT_CODENAME)" "$(CURDIR)/$$f"; \
-	done
-	@echo "==> Repository contents:"
-	@cd "$(APT_REPO_DIR)" && reprepro list "$(APT_CODENAME)"
-	@echo "==> Safe publication completed successfully"
+# ---------------------------------------------------------------------------
+# APT repository publishing
+# ---------------------------------------------------------------------------
+include packaging/publishing/targets.mk
 
 # ---------------------------------------------------------------------------
 # Tooling / environment checks
